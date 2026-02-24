@@ -6,6 +6,11 @@ import time
 import json
 import threading
 from flask import Flask, render_template, request, redirect, url_for, send_from_directory, send_file, Response, flash, get_flashed_messages, jsonify, make_response
+try:
+    from utils.watcher import start_media_watcher
+except ImportError:
+    start_media_watcher = None
+    print("[Watcher] watchdog not installed — automatic cache updates disabled.", flush=True)
 from difflib import get_close_matches, SequenceMatcher  # For string similarity
 from PIL import Image  # For image processing
 from datetime import datetime  # For handling dates and times
@@ -1706,8 +1711,72 @@ def toggle_unavailable():
         app.logger.error(f"Error toggling unavailability: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
+# Filesystem watcher callback — called by utils/watcher.py when a new media directory appears
+def _watcher_on_new_directory(media_type, dir_name, dir_path):
+    """Insert a new media directory into all active scan caches without a full rescan.
+
+    Reads the directory once (one listdir call) and reuses the file list across
+    all three artwork-type caches so we only hit the NFS mount a single time.
+    Only updates caches that already exist — if no cache is present yet the entry
+    will be picked up naturally on the next full scan or page load.
+    """
+    print(f"[Watcher] Processing new {media_type} directory: '{dir_name}'", flush=True)
+
+    # One listdir call shared across all artwork types
+    dir_files = set(safe_listdir(dir_path))
+
+    added_to = []
+    for artwork_type in ARTWORK_TYPES:
+        cached_list, _ = load_scan_cache(media_type, artwork_type)
+        if cached_list is None:
+            # No active cache for this artwork type yet — skip
+            continue
+
+        # Idempotency: skip if the directory is already recorded
+        if any(e.get('title') == dir_name or e.get('path') == dir_path for e in cached_list):
+            print(
+                f"[Watcher] '{dir_name}' already present in {media_type}/{artwork_type} cache",
+                flush=True,
+            )
+            continue
+
+        # Scan the directory (lightweight — no Image.open) using the pre-fetched file list
+        new_entry = scan_single_directory(
+            dir_name, dir_path, artwork_type,
+            dir_files=dir_files, lightweight=True,
+        )
+
+        cached_list.append(new_entry)
+        cached_list.sort(key=lambda x: strip_leading_the(x.get('title', '')).lower())
+        save_scan_cache(media_type, artwork_type, cached_list, len(cached_list))
+        added_to.append(artwork_type)
+
+    if added_to:
+        print(
+            f"[Watcher] '{dir_name}' added to {media_type} caches: {', '.join(added_to)}",
+            flush=True,
+        )
+    else:
+        print(
+            f"[Watcher] No active {media_type} caches to update for '{dir_name}' "
+            f"(will appear on next scan/page load)",
+            flush=True,
+        )
+
+
 # Main entry point for running the Flask application
 if __name__ == '__main__':
+    # Start filesystem watcher so new Radarr/Sonarr arrivals are auto-added to the cache.
+    # Poll interval is configurable via WATCHER_POLL_INTERVAL env var (default 60s for NFS).
+    if start_media_watcher is not None:
+        _watcher_poll_interval = int(os.getenv('WATCHER_POLL_INTERVAL', '60'))
+        start_media_watcher(
+            movie_folders,
+            tv_folders,
+            _watcher_on_new_directory,
+            poll_interval=_watcher_poll_interval,
+        )
+
     # Start the app, listening on all network interfaces at port 6789
     app.run(
         host="0.0.0.0",
