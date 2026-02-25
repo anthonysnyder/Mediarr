@@ -68,6 +68,7 @@
 - **Language Tags** - Filter by language when multiple options exist
 - **Auto-Mark Unavailable** - Zero TMDb results automatically marks item as unavailable
 - **SMB/NAS Optimized** - Adaptive throttling prevents mount overload
+- **Automatic Media Detection** - New Radarr/Sonarr arrivals appear in the UI within one poll cycle, no manual rescan needed
 - **Background Scanning** - Initial scans run async with progress tracking
 - **Checkpoint/Resume** - Scans can resume after container restart
 - **Slack Notifications** - Optional alerts when artwork is downloaded
@@ -159,6 +160,7 @@ TV Shows follow the same workflow as Movies - just select "TV Shows" in the side
 | `MOVIE_FOLDERS` | Yes | Comma-separated movie paths |
 | `TV_FOLDERS` | Yes | Comma-separated TV paths |
 | `SLACK_WEBHOOK_URL` | No | Webhook for download notifications |
+| `WATCHER_POLL_INTERVAL` | No | Filesystem poll interval in seconds (default: `60`). NFS/SMB mounts use polling instead of inotify — 60s is safe for NFS, lower if on fast local storage |
 
 ### Persistent Data
 

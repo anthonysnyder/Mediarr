@@ -66,6 +66,7 @@ Open your browser to: **http://localhost:6789**
 | `MOVIE_FOLDERS` | No | Comma-separated movie paths | `/movies,/kids-movies` |
 | `TV_FOLDERS` | No | Comma-separated TV paths | `/tv,/anime` |
 | `SLACK_WEBHOOK_URL` | No | Slack webhook for notifications | `https://hooks.slack.com/...` |
+| `WATCHER_POLL_INTERVAL` | No | Poll interval in seconds for new media detection (default: `60`) | `60` |
 
 **Default Paths:**
 - Movies: `/movies`
@@ -101,6 +102,9 @@ TV_FOLDERS=/tv,/kids-tv,/anime
 
 # Optional: Slack Notifications
 SLACK_WEBHOOK_URL=your_slack_webhook_url_here
+
+# Optional: Watcher poll interval in seconds (default 60, safe for NFS/SMB)
+# WATCHER_POLL_INTERVAL=60
 ```
 
 Then simplify docker-compose.yml:
