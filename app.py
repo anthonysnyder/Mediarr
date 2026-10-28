@@ -15,6 +15,7 @@ from difflib import get_close_matches, SequenceMatcher  # For string similarity
 from PIL import Image  # For image processing
 from datetime import datetime  # For handling dates and times
 from urllib.parse import unquote
+from werkzeug.security import safe_join
 
 # SMB health tracking - shared state for adaptive throttling
 _smb_health = {
@@ -1532,6 +1533,9 @@ def select_artwork():
 def select_poster():
     return select_artwork()
 
+# Only image files may be served by the artwork and cache routes
+SERVABLE_EXTENSIONS = ('.jpg', '.jpeg', '.png')
+
 # Route for serving artwork (posters, logos, backdrops) from the file system
 @app.route('/artwork/<path:filename>')
 def serve_artwork(filename):
@@ -1541,11 +1545,14 @@ def serve_artwork(filename):
     # Check if a "refresh" flag is present in the URL query parameters
     refresh = request.args.get('refresh', 'false')
     for base_folder in base_folders:
-        full_path = os.path.join(base_folder, filename)
+        # safe_join returns None if filename escapes base_folder (e.g. "../")
+        full_path = safe_join(base_folder, filename)
+        if full_path is None or not full_path.lower().endswith(SERVABLE_EXTENSIONS):
+            continue
         # Skip Synology NAS special directories
         if '@eaDir' in full_path:
             continue
-        if os.path.exists(full_path):
+        if os.path.isfile(full_path):
             # Serve the file from the appropriate directory using safe_send_file
             # to handle BlockingIOError on SMB mounts
             response = safe_send_file(full_path)
@@ -1568,8 +1575,11 @@ def serve_artwork(filename):
 def serve_cached_artwork(filename):
     """Serve artwork from local cache - much faster than SMB!"""
     try:
-        cache_file_path = os.path.join(CACHE_DIR, filename)
-        if os.path.exists(cache_file_path):
+        # safe_join returns None if filename escapes CACHE_DIR (e.g. "../")
+        cache_file_path = safe_join(CACHE_DIR, filename)
+        if cache_file_path is None or not cache_file_path.lower().endswith(SERVABLE_EXTENSIONS):
+            return "Cached file not found", 404
+        if os.path.isfile(cache_file_path):
             response = send_file(cache_file_path)
             # Set long-term caching since these are local files
             response.cache_control.max_age = 31536000  # 1 year
