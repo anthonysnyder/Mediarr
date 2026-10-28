@@ -4,6 +4,7 @@ import re
 import urllib.parse
 import time
 import json
+import io
 import threading
 from flask import Flask, render_template, request, redirect, url_for, send_from_directory, send_file, Response, flash, get_flashed_messages, jsonify, make_response
 try:
@@ -405,6 +406,13 @@ TMDB_API_KEY = os.getenv('TMDB_API_KEY')
 # Base URLs for TMDb API and poster images
 BASE_URL = "https://api.themoviedb.org/3"
 POSTER_BASE_URL = "https://image.tmdb.org/t/p/original"
+
+# Artwork may only be downloaded from TMDb's image host (prevents SSRF)
+ALLOWED_ARTWORK_HOST = "image.tmdb.org"
+
+def is_allowed_artwork_url(url):
+    parsed = urllib.parse.urlparse(url or '')
+    return parsed.scheme == 'https' and parsed.hostname == ALLOWED_ARTWORK_HOST and not parsed.username and parsed.port is None
 
 # Define base folders for organizing movies and TV shows
 # Environment variables allow flexible folder configuration without code changes
@@ -1264,6 +1272,24 @@ def save_artwork_and_thumbnail(artwork_url, media_title, save_dir, artwork_type=
     thumb_artwork_path = os.path.join(save_dir, f'{file_prefix}-thumb.{file_ext}')
 
     try:
+        # Reject anything that isn't a TMDb image URL before touching the network
+        if not is_allowed_artwork_url(artwork_url):
+            app.logger.error(f"Rejected artwork URL for '{media_title}': {artwork_url}")
+            return None
+
+        # Download and validate the artwork before removing existing files,
+        # so a failed or non-image download never wipes the current artwork
+        response = requests.get(artwork_url, timeout=30, allow_redirects=False)
+        if response.status_code != 200:
+            app.logger.error(f"Failed to download {artwork_type} for '{media_title}'. Status code: {response.status_code}")
+            return None
+        try:
+            with Image.open(io.BytesIO(response.content)) as probe:
+                probe.verify()
+        except Exception as e:
+            app.logger.error(f"Downloaded {artwork_type} for '{media_title}' is not a valid image: {e}")
+            return None
+
         # Remove any existing artwork files in the directory
         # Try multiple times with delay if file is busy
         for ext in ['jpg', 'jpeg', 'png']:
@@ -1310,73 +1336,67 @@ def save_artwork_and_thumbnail(artwork_url, media_title, save_dir, artwork_type=
                     else:
                         app.logger.warning(f"Could not remove {existing_thumb}: {e}")
 
-        # Download the full-resolution artwork from the URL
-        response = requests.get(artwork_url)
-        if response.status_code == 200:
-            # Save the downloaded artwork image
-            with open(full_artwork_path, 'wb') as file:
-                file.write(response.content)
+        # Save the downloaded artwork image
+        with open(full_artwork_path, 'wb') as file:
+            file.write(response.content)
 
-            # Create a thumbnail using Pillow image processing library
-            with Image.open(full_artwork_path) as img:
-                # For non-logo artwork, convert RGBA to RGB (logos keep transparency)
-                if artwork_type != 'logo':
-                    if img.mode in ('RGBA', 'LA', 'P'):
-                        # Create white background for transparent images
-                        background = Image.new('RGB', img.size, (255, 255, 255))
-                        if img.mode == 'P':
-                            img = img.convert('RGBA')
-                        background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
-                        img = background
-                    elif img.mode != 'RGB':
-                        img = img.convert('RGB')
-                else:
-                    # Logos: ensure RGBA mode for transparency
-                    if img.mode != 'RGBA':
+        # Create a thumbnail using Pillow image processing library
+        with Image.open(full_artwork_path) as img:
+            # For non-logo artwork, convert RGBA to RGB (logos keep transparency)
+            if artwork_type != 'logo':
+                if img.mode in ('RGBA', 'LA', 'P'):
+                    # Create white background for transparent images
+                    background = Image.new('RGB', img.size, (255, 255, 255))
+                    if img.mode == 'P':
                         img = img.convert('RGBA')
+                    background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+                    img = background
+                elif img.mode != 'RGB':
+                    img = img.convert('RGB')
+            else:
+                # Logos: ensure RGBA mode for transparency
+                if img.mode != 'RGBA':
+                    img = img.convert('RGBA')
 
-                # Different thumbnail sizes for different artwork types
-                if artwork_type == 'poster':
-                    # Posters: 300x450
-                    target_ratio = 300 / 450
-                    thumb_size = (300, 450)
-                elif artwork_type == 'logo':
-                    # Logos: maintain aspect ratio, max width 400
-                    thumb_size = (400, int(400 / (img.width / img.height)))
-                    target_ratio = None  # Skip cropping for logos
-                else:  # backdrop
-                    # Backdrops: 400x225 (16:9 ratio)
-                    target_ratio = 400 / 225
-                    thumb_size = (400, 225)
+            # Different thumbnail sizes for different artwork types
+            if artwork_type == 'poster':
+                # Posters: 300x450
+                target_ratio = 300 / 450
+                thumb_size = (300, 450)
+            elif artwork_type == 'logo':
+                # Logos: maintain aspect ratio, max width 400
+                thumb_size = (400, int(400 / (img.width / img.height)))
+                target_ratio = None  # Skip cropping for logos
+            else:  # backdrop
+                # Backdrops: 400x225 (16:9 ratio)
+                target_ratio = 400 / 225
+                thumb_size = (400, 225)
 
-                # Crop the image to match the target aspect ratio (skip for logos)
-                if target_ratio is not None:
-                    aspect_ratio = img.width / img.height
-                    if aspect_ratio > target_ratio:
-                        # Image is wider than desired ratio, crop the sides
-                        new_width = int(img.height * target_ratio)
-                        left = (img.width - new_width) // 2
-                        img = img.crop((left, 0, left + new_width, img.height))
-                    else:
-                        # Image is taller than desired ratio, crop the top and bottom
-                        new_height = int(img.width / target_ratio)
-                        top = (img.height - new_height) // 2
-                        img = img.crop((0, top, img.width, top + new_height))
-
-                # Resize the image with high-quality Lanczos resampling
-                img = img.resize(thumb_size, Image.LANCZOS)
-
-                # Save the thumbnail - PNG for logos (transparency), JPEG for others
-                if artwork_type == 'logo':
-                    img.save(thumb_artwork_path, "PNG", optimize=True)
+            # Crop the image to match the target aspect ratio (skip for logos)
+            if target_ratio is not None:
+                aspect_ratio = img.width / img.height
+                if aspect_ratio > target_ratio:
+                    # Image is wider than desired ratio, crop the sides
+                    new_width = int(img.height * target_ratio)
+                    left = (img.width - new_width) // 2
+                    img = img.crop((left, 0, left + new_width, img.height))
                 else:
-                    img.save(thumb_artwork_path, "JPEG", quality=90)
+                    # Image is taller than desired ratio, crop the top and bottom
+                    new_height = int(img.width / target_ratio)
+                    top = (img.height - new_height) // 2
+                    img = img.crop((0, top, img.width, top + new_height))
 
-            app.logger.info(f"{artwork_config['name']} and thumbnail saved successfully for '{media_title}'")
-            return full_artwork_path  # Return the local path where the artwork was saved
-        else:
-            app.logger.error(f"Failed to download {artwork_type} for '{media_title}'. Status code: {response.status_code}")
-            return None
+            # Resize the image with high-quality Lanczos resampling
+            img = img.resize(thumb_size, Image.LANCZOS)
+
+            # Save the thumbnail - PNG for logos (transparency), JPEG for others
+            if artwork_type == 'logo':
+                img.save(thumb_artwork_path, "PNG", optimize=True)
+            else:
+                img.save(thumb_artwork_path, "JPEG", quality=90)
+
+        app.logger.info(f"{artwork_config['name']} and thumbnail saved successfully for '{media_title}'")
+        return full_artwork_path  # Return the local path where the artwork was saved
 
     except Exception as e:
         app.logger.error(f"Error saving {artwork_type} and generating thumbnail for '{media_title}': {e}")
