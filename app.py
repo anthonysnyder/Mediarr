@@ -6,6 +6,7 @@ import time
 import json
 import io
 import threading
+import shutil
 from flask import Flask, render_template, request, redirect, url_for, send_from_directory, send_file, Response, flash, get_flashed_messages, jsonify, make_response
 try:
     from utils.watcher import start_media_watcher
@@ -142,67 +143,198 @@ def safe_send_file(path: str, **kwargs):
     """Send file with basic error handling. macOS handles SMB errors natively."""
     return send_file(path, **kwargs)
 
+# ---------------------------------------------------------------------------
+# Safe JSON persistence
+#
+# Every JSON file in /app/data used to be written with open(path, 'w'), which
+# truncates the file before writing. Flask serves requests on parallel threads,
+# so a concurrent reader could see an empty or half-written file. For the
+# unavailable-artwork flags that was destructive: the failed read returned {},
+# and the next save overwrote every flag (seen 2026-11-06 21:55:31 UTC).
+#
+# _atomic_write_json writes to a temp file and os.replace()s it into place, so
+# readers only ever see the old file or the new file. _data_lock serialises
+# read-modify-write cycles so two updates can't drop each other's changes.
+# ---------------------------------------------------------------------------
+_data_lock = threading.RLock()
+
+
+def _atomic_write_json(path, data, **dump_kwargs):
+    """Write JSON to path atomically (temp file + os.replace)."""
+    directory = os.path.dirname(path) or '.'
+    os.makedirs(directory, exist_ok=True)
+    tmp_path = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    try:
+        with open(tmp_path, 'w') as f:
+            json.dump(data, f, **dump_kwargs)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
 # Unavailability tracking - persisted to JSON file in data directory
 UNAVAILABLE_DATA_FILE = os.path.join(os.path.dirname(__file__), 'data', 'unavailable_artwork.json')
+UNAVAILABLE_BACKUP_FILE = UNAVAILABLE_DATA_FILE + '.bak'
+
+
+class UnavailableDataError(Exception):
+    """The flags file exists but could not be read. Never save over it."""
+
+
+def _read_unavailable_file():
+    """Read the flags file. Returns {} only if the file does not exist.
+    Raises UnavailableDataError if it exists but can't be parsed.
+
+    Takes _data_lock: on Docker Desktop bind mounts os.replace() is not atomic
+    for readers (the file briefly appears missing), so reads must not overlap writes."""
+    with _data_lock:
+        return _read_unavailable_file_locked()
+
+
+def _read_unavailable_file_locked():
+    if not os.path.exists(UNAVAILABLE_DATA_FILE):
+        return {}
+    try:
+        with open(UNAVAILABLE_DATA_FILE, 'r') as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError(f"expected a JSON object, got {type(data).__name__}")
+        return data
+    except Exception as e:
+        raise UnavailableDataError(str(e)) from e
+
 
 def load_unavailable_data():
-    """Load unavailable artwork tracking from JSON file."""
-    if os.path.exists(UNAVAILABLE_DATA_FILE):
-        try:
-            with open(UNAVAILABLE_DATA_FILE, 'r') as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"Error loading unavailable data: {e}", flush=True)
-            return {}
-    return {}
+    """Load unavailable artwork tracking for READ-ONLY use.
+    On a bad file, returns {} so pages still render, but never use this result to save."""
+    try:
+        return _read_unavailable_file()
+    except UnavailableDataError as e:
+        print(f"Error loading unavailable data: {e}", flush=True)
+        return {}
+
+
+def _preserve_corrupt_unavailable_file(reason):
+    """Keep a copy of an unreadable flags file so it can be inspected or recovered."""
+    stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    corrupt_path = f"{UNAVAILABLE_DATA_FILE}.corrupt-{stamp}"
+    try:
+        shutil.copy2(UNAVAILABLE_DATA_FILE, corrupt_path)
+        print(f"Flags file unreadable ({reason}); preserved copy at {corrupt_path}. "
+              f"Refusing to save so existing flags are not overwritten.", flush=True)
+    except Exception as e:
+        print(f"Flags file unreadable ({reason}) and copy failed: {e}. Refusing to save.", flush=True)
+
 
 def save_unavailable_data(data):
-    """Save unavailable artwork tracking to JSON file."""
-    try:
-        with open(UNAVAILABLE_DATA_FILE, 'w') as f:
-            json.dump(data, f, indent=2)
-        return True
-    except Exception as e:
-        print(f"Error saving unavailable data: {e}", flush=True)
-        return False
+    """Save unavailable artwork tracking atomically, keeping a rolling .bak of the previous version."""
+    with _data_lock:
+        try:
+            if os.path.exists(UNAVAILABLE_DATA_FILE):
+                shutil.copy2(UNAVAILABLE_DATA_FILE, UNAVAILABLE_BACKUP_FILE)
+            _atomic_write_json(UNAVAILABLE_DATA_FILE, data, indent=2)
+            return True
+        except Exception as e:
+            print(f"Error saving unavailable data: {e}", flush=True)
+            return False
+
 
 def is_artwork_unavailable(directory, artwork_type):
     """Check if artwork type is marked as unavailable for a directory."""
     unavailable_data = load_unavailable_data()
     return unavailable_data.get(directory, {}).get(artwork_type, False)
 
+
 def mark_artwork_unavailable(directory, artwork_type, unavailable=True):
     """Mark artwork type as unavailable (or available) for a directory."""
-    unavailable_data = load_unavailable_data()
-    if directory not in unavailable_data:
-        unavailable_data[directory] = {}
-    unavailable_data[directory][artwork_type] = unavailable
-    success = save_unavailable_data(unavailable_data)
-    if success:
-        _update_caches_unavailable(directory, artwork_type, unavailable)
-    return success
+    with _data_lock:
+        try:
+            unavailable_data = _read_unavailable_file()
+        except UnavailableDataError as e:
+            _preserve_corrupt_unavailable_file(e)
+            return False
+        if unavailable_data.get(directory, {}).get(artwork_type) == unavailable:
+            success = True  # already recorded (e.g. duplicate request); nothing to write
+        else:
+            unavailable_data.setdefault(directory, {})[artwork_type] = unavailable
+            success = save_unavailable_data(unavailable_data)
+        if success:
+            _update_caches_unavailable(directory, artwork_type, unavailable)
+        return success
+
 
 def _update_caches_unavailable(directory, artwork_type, unavailable):
     """Update all scan caches to reflect unavailability change."""
     unavailable_key = f"{artwork_type}_unavailable"
     cache_dir = os.path.join(os.path.dirname(__file__), 'data', 'artwork_cache')
-    for media_type in ['movie', 'tv']:
-        for art_type_key in ['poster', 'logo', 'backdrop']:
-            cache_file = os.path.join(cache_dir, f'scan_cache_{media_type}_{art_type_key}.json')
-            if os.path.exists(cache_file):
+    with _data_lock:
+        for media_type in ['movie', 'tv']:
+            for art_type_key in ['poster', 'logo', 'backdrop']:
+                cache_file = os.path.join(cache_dir, f'scan_cache_{media_type}_{art_type_key}.json')
+                if os.path.exists(cache_file):
+                    try:
+                        with open(cache_file, 'r') as f:
+                            cache_data = json.load(f)
+                        updated = False
+                        for item in cache_data.get('media_list', []):
+                            if item.get('title') == directory and item.get(unavailable_key) != unavailable:
+                                item[unavailable_key] = unavailable
+                                updated = True
+                        if updated:
+                            _atomic_write_json(cache_file, cache_data)
+                    except Exception as e:
+                        print(f"Error updating cache {cache_file}: {e}", flush=True)
+
+
+def reconcile_unavailable_from_caches():
+    """Copy unavailable flags that exist only in the scan caches back into the flags file.
+
+    The scan caches keep their own copy of each flag. If the flags file ever loses
+    entries, the caches still have them until the next full rescan rebuilds the
+    caches from the (now incomplete) file. Running this at startup restores them.
+    Only adds missing True flags; never overrides an explicit entry in the file."""
+    cache_dir = os.path.join(os.path.dirname(__file__), 'data', 'artwork_cache')
+    with _data_lock:
+        try:
+            data = _read_unavailable_file()
+        except UnavailableDataError as e:
+            _preserve_corrupt_unavailable_file(e)
+            return 0
+        restored = 0
+        for media_type in ['movie', 'tv']:
+            for art_type_key in ['poster', 'logo', 'backdrop']:
+                cache_file = os.path.join(cache_dir, f'scan_cache_{media_type}_{art_type_key}.json')
+                if not os.path.exists(cache_file):
+                    continue
                 try:
                     with open(cache_file, 'r') as f:
                         cache_data = json.load(f)
-                    updated = False
-                    for item in cache_data.get('media_list', []):
-                        if item.get('title') == directory:
-                            item[unavailable_key] = unavailable
-                            updated = True
-                    if updated:
-                        with open(cache_file, 'w') as f:
-                            json.dump(cache_data, f)
                 except Exception as e:
-                    print(f"Error updating cache {cache_file}: {e}", flush=True)
+                    print(f"Reconcile: skipping unreadable cache {cache_file}: {e}", flush=True)
+                    continue
+                for item in cache_data.get('media_list', []):
+                    title = item.get('title')
+                    if not title:
+                        continue
+                    for t in ['poster', 'logo', 'backdrop']:
+                        if item.get(f'{t}_unavailable') and t not in data.get(title, {}):
+                            data.setdefault(title, {})[t] = True
+                            restored += 1
+        if restored:
+            if save_unavailable_data(data):
+                print(f"Reconcile: restored {restored} unavailable flag(s) from scan caches", flush=True)
+            else:
+                return 0
+        else:
+            print("Reconcile: flags file already matches scan caches", flush=True)
+        return restored
+
 
 # Local cache for artwork thumbnails - use persistent data directory
 CACHE_DIR = os.path.join(os.path.dirname(__file__), 'data', 'artwork_cache')
@@ -261,13 +393,18 @@ def save_cache_metadata(metadata):
     """Save cache metadata (last refresh time, stats, etc.)."""
     ensure_cache_dir()
     try:
-        with open(CACHE_METADATA_FILE, 'w') as f:
-            json.dump(metadata, f, indent=2)
+        with _data_lock:
+            _atomic_write_json(CACHE_METADATA_FILE, metadata, indent=2)
     except Exception as e:
         print(f"Error saving cache metadata: {e}", flush=True)
 
 def load_cache_metadata():
     """Load cache metadata."""
+    with _data_lock:
+        return _load_cache_metadata_locked()
+
+
+def _load_cache_metadata_locked():
     if os.path.exists(CACHE_METADATA_FILE):
         try:
             with open(CACHE_METADATA_FILE, 'r') as f:
@@ -280,18 +417,23 @@ def save_scan_cache(media_type, artwork_type, media_list, total):
     """Save directory scan results to avoid repeated SMB scans."""
     cache_file = os.path.join(CACHE_DIR, f'scan_cache_{media_type}_{artwork_type}.json')
     try:
-        with open(cache_file, 'w') as f:
-            json.dump({
+        with _data_lock:
+            _atomic_write_json(cache_file, {
                 'media_list': media_list,
                 'total': total,
                 'timestamp': datetime.now().isoformat()
-            }, f)
+            })
         print(f"Saved scan cache for {media_type}/{artwork_type}: {total} items", flush=True)
     except Exception as e:
         print(f"Error saving scan cache: {e}", flush=True)
 
 def load_scan_cache(media_type, artwork_type):
     """Load cached directory scan results. Returns None if cache is empty or missing."""
+    with _data_lock:
+        return _load_scan_cache_locked(media_type, artwork_type)
+
+
+def _load_scan_cache_locked(media_type, artwork_type):
     cache_file = os.path.join(CACHE_DIR, f'scan_cache_{media_type}_{artwork_type}.json')
     if os.path.exists(cache_file):
         try:
@@ -322,6 +464,13 @@ def update_single_cache_entry(media_type, artwork_type, directory_path):
         print(f"Cache file doesn't exist, skipping update: {cache_file}", flush=True)
         return False
 
+    with _data_lock:
+        return _update_single_cache_entry_locked(media_type, artwork_type, directory_path,
+                                                 directory_name, has_key, cache_file)
+
+
+def _update_single_cache_entry_locked(media_type, artwork_type, directory_path,
+                                      directory_name, has_key, cache_file):
     try:
         with open(cache_file, 'r') as f:
             data = json.load(f)
@@ -354,8 +503,7 @@ def update_single_cache_entry(media_type, artwork_type, directory_path):
                         print(f"Updated cache entry for {directory_name}: {artwork_type} now found", flush=True)
                         break
 
-                with open(cache_file, 'w') as f:
-                    json.dump(data, f)
+                _atomic_write_json(cache_file, data)
                 break
 
         if not found_match:
@@ -377,8 +525,7 @@ def update_single_cache_entry(media_type, artwork_type, directory_path):
                 for item in other_data.get('media_list', []):
                     if item.get('title') == directory_name or item.get('path') == directory_path:
                         item[has_key] = True
-                        with open(other_cache_file, 'w') as f:
-                            json.dump(other_data, f)
+                        _atomic_write_json(other_cache_file, other_data)
                         print(f"Updated cross-type flag {has_key} in {other_type} cache for {directory_name}", flush=True)
                         break
             except Exception as e:
@@ -730,18 +877,23 @@ def _save_checkpoint(media_type, artwork_type, media_list, scanned_titles):
     """Save scan progress to a checkpoint file for resume after restart."""
     checkpoint_path = _get_checkpoint_path(media_type, artwork_type)
     try:
-        with open(checkpoint_path, 'w') as f:
-            json.dump({
+        with _data_lock:
+            _atomic_write_json(checkpoint_path, {
                 'media_list': media_list,
                 'scanned_titles': list(scanned_titles),
                 'timestamp': datetime.now().isoformat()
-            }, f)
+            })
     except Exception as e:
         print(f"Error saving checkpoint: {e}", flush=True)
 
 
 def _load_checkpoint(media_type, artwork_type):
     """Load a scan checkpoint. Returns (media_list, scanned_titles_set) or (None, None)."""
+    with _data_lock:
+        return _load_checkpoint_locked(media_type, artwork_type)
+
+
+def _load_checkpoint_locked(media_type, artwork_type):
     checkpoint_path = _get_checkpoint_path(media_type, artwork_type)
     if os.path.exists(checkpoint_path):
         try:
@@ -1796,6 +1948,13 @@ def _watcher_on_new_directory(media_type, dir_name, dir_path):
 
 # Main entry point for running the Flask application
 if __name__ == '__main__':
+    # Restore any unavailable flags that survive only in the scan caches
+    # (protects against the flags file having lost entries).
+    try:
+        reconcile_unavailable_from_caches()
+    except Exception as e:
+        print(f"Reconcile failed: {e}", flush=True)
+
     # Start filesystem watcher so new Radarr/Sonarr arrivals are auto-added to the cache.
     # Poll interval is configurable via WATCHER_POLL_INTERVAL env var (default 60s for NFS).
     if start_media_watcher is not None:
