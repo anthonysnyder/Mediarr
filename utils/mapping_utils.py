@@ -42,8 +42,11 @@ def save_directory_mapping(mapping: Dict):
         # Ensure data directory exists
         os.makedirs(os.path.dirname(MAPPING_FILE), exist_ok=True)
 
-        with open(MAPPING_FILE, 'w') as f:
+        # Write atomically so a concurrent reader never sees a half-written file
+        tmp_path = f"{MAPPING_FILE}.tmp.{os.getpid()}"
+        with open(tmp_path, 'w') as f:
             json.dump(mapping, f, indent=2)
+        os.replace(tmp_path, MAPPING_FILE)
 
         print(f"Saved directory mapping to {MAPPING_FILE}")
 
