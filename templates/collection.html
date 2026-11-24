@@ -148,6 +148,12 @@
         .card-action-btn:hover {
             background-color: rgba(0, 123, 255, 1);
         }
+        .card-action-chain {
+            background-color: rgba(40, 167, 69, 0.9);
+        }
+        .card-action-chain:hover {
+            background-color: rgba(40, 167, 69, 1);
+        }
         .movie-card img {
             width: 100%;
             height: auto;
@@ -370,6 +376,11 @@
                                 {{ config.emoji }}<br>{{ config.name }}
                             </button>
                             {% endfor %}
+                            <button class="card-action-btn card-action-chain"
+                                    title="Poster, then logo, then backdrop in one pass"
+                                    onclick="searchArtwork('{{ item.title|replace("'", "\\'") }}', '{{ item.title|replace("'", "\\'") }}', 'poster', true)">
+                                ⚡<br>All 3
+                            </button>
                         </div>
                     </div>
                     <h5>{{ item.title }}</h5>
@@ -711,11 +722,11 @@
         setTimeout(() => confirmation.remove(), 2000);
     }
 
-    function searchArtwork(title, directory, artworkType) {
+    function searchArtwork(title, directory, artworkType, chain) {
         // Strip year and TMDb ID from title for better search results
         // e.g., "The 13th Warrior (1999) {tmdb-123}" becomes "The 13th Warrior"
         const cleanTitle = title.replace(/\s*\(\d{4}\).*$/, '').trim();
-        window.location.href = `/search_${mediaType}?query=${encodeURIComponent(cleanTitle)}&directory=${encodeURIComponent(directory)}&artwork_type=${artworkType}`;
+        window.location.href = `/search_${mediaType}?query=${encodeURIComponent(cleanTitle)}&directory=${encodeURIComponent(directory)}&artwork_type=${artworkType}${chain ? '&chain=1' : ''}`;
     }
 </script>
 
