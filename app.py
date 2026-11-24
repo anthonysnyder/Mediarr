@@ -1247,7 +1247,8 @@ def search_movie():
                          results=results,
                          content_type='movie',
                          artwork_type=artwork_type,
-                         directory=directory)
+                         directory=directory,
+                         chain='1' if _is_chain(request.args) else None)
 # Route for searching TV shows using TMDb API
 @app.route('/search_tv', methods=['GET'])
 def search_tv():
@@ -1287,14 +1288,72 @@ def search_tv():
                          results=results,
                          content_type="tv",
                          artwork_type=artwork_type,
-                         directory=directory)
+                         directory=directory,
+                         chain='1' if _is_chain(request.args) else None)
 
 # Route for selecting a movie and displaying available artwork
+# ---------------------------------------------------------------------------
+# "All 3" chained flow: poster -> logo -> backdrop in one pass.
+# Each step either downloads, gets skipped, or (if TMDb has nothing) is flagged
+# unavailable, then the user is sent straight to the next type still missing.
+# ---------------------------------------------------------------------------
+CHAIN_ORDER = ['poster', 'logo', 'backdrop']
+
+def _is_chain(source):
+    return str(source.get('chain', '')).lower() in ('1', 'true', 'on')
+
+def _resolve_media_dir(media_type, directory):
+    """Map a folder name to its full path in the movie/TV base folders."""
+    if not directory:
+        return None
+    base_folders = movie_folders if media_type == 'movie' else tv_folders
+    for base_folder in base_folders:
+        potential_path = os.path.join(base_folder, directory)
+        if safe_isdir(potential_path):
+            return potential_path
+    return None
+
+def _dir_has_artwork(dir_path, artwork_type):
+    prefix = ARTWORK_TYPES[artwork_type]['file_prefix']
+    files = set(safe_listdir(dir_path))
+    return any(f"{prefix}.{ext}" in files for ext in ('jpg', 'jpeg', 'png'))
+
+def _chain_step_needed(media_type, directory, artwork_type):
+    """A chain step is needed unless the folder already has it or it's flagged unavailable."""
+    if not directory:
+        return True
+    if is_artwork_unavailable(directory, artwork_type):
+        return False
+    dir_path = _resolve_media_dir(media_type, directory)
+    return not (dir_path and _dir_has_artwork(dir_path, artwork_type))
+
+def chain_next_redirect(media_type, tmdb_id, directory, current_type, media_title=''):
+    """Redirect to the next artwork type in the chain that is still missing,
+    or back to the Missing view when the chain is finished."""
+    idx = CHAIN_ORDER.index(current_type) if current_type in CHAIN_ORDER else len(CHAIN_ORDER) - 1
+    for next_type in CHAIN_ORDER[idx + 1:]:
+        if _chain_step_needed(media_type, directory, next_type):
+            route = 'select_tv' if media_type == 'tv' else 'select_movie'
+            id_arg = {'tv_id': tmdb_id} if media_type == 'tv' else {'movie_id': tmdb_id}
+            return redirect(url_for(route, artwork_type=next_type, directory=directory, chain='1', **id_arg))
+    redirect_url = url_for('tv_shows' if media_type == 'tv' else 'index', artwork_type=CHAIN_ORDER[0], show_missing='true')
+    return redirect(f"{redirect_url}#{generate_clean_id(directory or media_title)}")
+
+@app.route('/chain_skip/<media_type>/<int:tmdb_id>/<artwork_type>')
+def chain_skip(media_type, tmdb_id, artwork_type):
+    """Skip the current chain step without downloading or flagging anything."""
+    if media_type not in ('movie', 'tv'):
+        media_type = 'movie'
+    if artwork_type in ARTWORK_TYPES:
+        flash(f"Skipped {ARTWORK_TYPES[artwork_type]['name'][:-1].lower()}", 'info')
+    return chain_next_redirect(media_type, tmdb_id, request.args.get('directory', ''), artwork_type)
+
 @app.route('/select_movie/<int:movie_id>',methods=['GET'])
 @app.route('/select_movie/<int:movie_id>/<artwork_type>', methods=['GET'])
 def select_movie(movie_id, artwork_type='poster'):
     # Get directory from URL parameters
     directory = request.args.get('directory', '')
+    chain = _is_chain(request.args)
 
     # Validate artwork type
     if artwork_type not in ARTWORK_TYPES:
@@ -1302,6 +1361,10 @@ def select_movie(movie_id, artwork_type='poster'):
 
     artwork_config = ARTWORK_TYPES[artwork_type]
     tmdb_key = artwork_config['tmdb_key']
+
+    # Chain mode: skip straight past a type this folder already has
+    if chain and directory and not _chain_step_needed('movie', directory, artwork_type):
+        return chain_next_redirect('movie', movie_id, directory, artwork_type)
 
     # Fetch detailed information about the selected movie from TMDb API
     movie_details = requests.get(f"{BASE_URL}/movie/{movie_id}", params={"api_key": TMDB_API_KEY}).json()
@@ -1328,6 +1391,8 @@ def select_movie(movie_id, artwork_type='poster'):
         print(f"No {artwork_type} artwork available for {movie_title}, marking as unavailable", flush=True)
         mark_artwork_unavailable(directory, artwork_type, True)
         flash(f'No {artwork_type} artwork available on TMDb. Marked as unavailable.', 'info')
+        if chain:
+            return chain_next_redirect('movie', movie_id, directory, artwork_type, movie_title)
         return redirect(url_for('index', artwork_type=artwork_type, show_missing='true'))
 
     # Sort artwork by resolution in descending order (highest resolution first)
@@ -1348,7 +1413,9 @@ def select_movie(movie_id, artwork_type='poster'):
                          artwork_type=artwork_type,
                          artwork_config=artwork_config,
                          tmdb_id=movie_id,
-                         directory=directory)
+                         directory=directory,
+                         chain=chain,
+                         chain_order=CHAIN_ORDER)
 
 # Route for selecting a TV show and displaying available artwork
 @app.route('/select_tv/<int:tv_id>', methods=['GET'])
@@ -1356,6 +1423,7 @@ def select_movie(movie_id, artwork_type='poster'):
 def select_tv(tv_id, artwork_type='poster'):
     # Get directory from URL parameters
     directory = request.args.get('directory', '')
+    chain = _is_chain(request.args)
 
     # Validate artwork type
     if artwork_type not in ARTWORK_TYPES:
@@ -1363,6 +1431,10 @@ def select_tv(tv_id, artwork_type='poster'):
 
     artwork_config = ARTWORK_TYPES[artwork_type]
     tmdb_key = artwork_config['tmdb_key']
+
+    # Chain mode: skip straight past a type this folder already has
+    if chain and directory and not _chain_step_needed('tv', directory, artwork_type):
+        return chain_next_redirect('tv', tv_id, directory, artwork_type)
 
     # Fetch detailed information about the selected TV show from TMDb API
     tv_details = requests.get(f"{BASE_URL}/tv/{tv_id}", params={"api_key": TMDB_API_KEY}).json()
@@ -1388,6 +1460,8 @@ def select_tv(tv_id, artwork_type='poster'):
         print(f"No {artwork_type} artwork available for {tv_title}, marking as unavailable", flush=True)
         mark_artwork_unavailable(directory, artwork_type, True)
         flash(f'No {artwork_type} artwork available on TMDb. Marked as unavailable.', 'info')
+        if chain:
+            return chain_next_redirect('tv', tv_id, directory, artwork_type, tv_title)
         return redirect(url_for('tv_shows', artwork_type=artwork_type, show_missing='true'))
 
     # Sort artwork by resolution in descending order (highest resolution first)
@@ -1408,7 +1482,9 @@ def select_tv(tv_id, artwork_type='poster'):
                          artwork_type=artwork_type,
                          artwork_config=artwork_config,
                          tmdb_id=tv_id,
-                         directory=directory)
+                         directory=directory,
+                         chain=chain,
+                         chain_order=CHAIN_ORDER)
 
 # Function to handle artwork download and thumbnail creation
 def save_artwork_and_thumbnail(artwork_url, media_title, save_dir, artwork_type='poster'):
@@ -1572,6 +1648,8 @@ def select_artwork():
         media_type = request.form['media_type']  # Should be either 'movie' or 'tv'
         artwork_type = request.form.get('artwork_type', 'poster')  # Default to poster for backwards compat
         directory = request.form.get('directory', '')  # Direct directory path if provided
+        chain = _is_chain(request.form)
+        tmdb_id = request.form.get('tmdb_id', type=int)
 
         # Validate artwork type
         if artwork_type not in ARTWORK_TYPES:
@@ -1606,6 +1684,8 @@ def select_artwork():
                         flash(f"Failed to download {ARTWORK_TYPES[artwork_type]['name'][:-1]} for '{media_title}'", 'error')
                     # Redirect back to the same artwork type tab with missing filter enabled
                     redirect_url = url_for('tv_shows' if media_type == 'tv' else 'index', artwork_type=artwork_type, show_missing='true')
+                    if chain and tmdb_id:
+                        return chain_next_redirect(media_type, tmdb_id, os.path.basename(save_dir), artwork_type, media_title)
                     return redirect(f"{redirect_url}#{generate_clean_id(media_title)}")
             # If we get here, directory was provided but not found - log and fall through to fuzzy matching
             print(f"Warning: Provided directory '{directory}' not found in any base folder, falling back to fuzzy matching", flush=True)
@@ -1659,6 +1739,8 @@ def select_artwork():
                 flash(f"Failed to download {ARTWORK_TYPES[artwork_type]['name'][:-1]} for '{media_title}'", 'error')
             # Redirect back to the same artwork type tab with missing filter enabled
             redirect_url = url_for('tv_shows' if media_type == 'tv' else 'index', artwork_type=artwork_type, show_missing='true')
+            if chain and tmdb_id:
+                return chain_next_redirect(media_type, tmdb_id, os.path.basename(save_dir), artwork_type, media_title)
             return redirect(f"{redirect_url}#{generate_clean_id(media_title)}")
 
         # If no exact match, use best similarity match above a threshold
@@ -1680,6 +1762,8 @@ def select_artwork():
                 flash(f"Failed to download {ARTWORK_TYPES[artwork_type]['name'][:-1]} for '{media_title}'", 'error')
             # Redirect back to the same artwork type tab with missing filter enabled
             redirect_url = url_for('tv_shows' if media_type == 'tv' else 'index', artwork_type=artwork_type, show_missing='true')
+            if chain and tmdb_id:
+                return chain_next_redirect(media_type, tmdb_id, os.path.basename(save_dir), artwork_type, media_title)
             return redirect(f"{redirect_url}#{generate_clean_id(media_title)}")
 
         # If no suitable directory found, present user with directory selection options
@@ -1689,7 +1773,9 @@ def select_artwork():
                              media_title=media_title,
                              artwork_url=artwork_url,
                              media_type=media_type,
-                             artwork_type=artwork_type)
+                             artwork_type=artwork_type,
+                             chain='1' if chain else '',
+                             tmdb_id=tmdb_id or '')
 
     except FileNotFoundError as fnf_error:
         # Log and handle file not found errors
@@ -1777,6 +1863,8 @@ def confirm_directory():
     artwork_url = request.form.get('artwork_url')
     content_type = request.form.get('content_type', 'movie')  # Default to 'movie'
     artwork_type = request.form.get('artwork_type', 'poster')  # Default to 'poster'
+    chain = _is_chain(request.form)
+    tmdb_id = request.form.get('tmdb_id', type=int)
 
     # Validate artwork type
     if artwork_type not in ARTWORK_TYPES:
@@ -1820,6 +1908,10 @@ def confirm_directory():
     else:
         app.logger.error(f"Failed to save {artwork_type} for '{media_title}'")
         return f"Failed to save {artwork_type}", 500
+
+    if chain and tmdb_id:
+        return chain_next_redirect('tv' if content_type == 'tv' else 'movie', tmdb_id,
+                                   selected_directory, artwork_type, media_title)
 
     # Generate clean ID for navigation anchor
     anchor = generate_clean_id(media_title)

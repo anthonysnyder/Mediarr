@@ -68,7 +68,7 @@
                         {% endif %}
                     </p>
                     <!-- Button to select the result and proceed to artwork selection -->
-                    <a href="{% if content_type == 'tv' %}{{ url_for('select_tv', tv_id=result.id, artwork_type=artwork_type|default('poster'), directory=directory) }}{% else %}{{ url_for('select_movie', movie_id=result.id, artwork_type=artwork_type|default('poster'), directory=directory) }}{% endif %}" class="btn btn-primary">Select</a>
+                    <a href="{% if content_type == 'tv' %}{{ url_for('select_tv', tv_id=result.id, artwork_type=artwork_type|default('poster'), directory=directory, chain=chain) }}{% else %}{{ url_for('select_movie', movie_id=result.id, artwork_type=artwork_type|default('poster'), directory=directory, chain=chain) }}{% endif %}" class="btn btn-primary">Select</a>
                 </div>
             </div>
         </div>

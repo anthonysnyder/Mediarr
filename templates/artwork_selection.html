@@ -158,11 +158,40 @@
             font-size: 0.7rem;
             margin-left: 0.5rem;
         }
+        .chain-bar {
+            display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center;
+            gap: 0.75rem; background-color: #2b3035; border: 1px solid #495057;
+            border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1rem;
+        }
+        .chain-steps { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+        .chain-step { padding: 0.25rem 0.6rem; border-radius: 4px; background-color: #495057; color: #adb5bd; font-size: 0.85rem; }
+        .chain-step.current { background-color: #007bff; color: #fff; font-weight: bold; }
+        .chain-step.done { background-color: #28a745; color: #fff; }
+        .chain-arrow { color: #6c757d; }
+        .chain-actions { display: flex; gap: 0.5rem; }
     </style>
 </head>
 <body>
     <div class="container-fluid" style="max-width: 1600px; padding: 2rem;">
         <a href="#" class="back-button" onclick="history.back(); return false;">← Back to Search Results</a>
+
+        {% if chain %}
+        {% set step = chain_order.index(artwork_type) + 1 %}
+        <div class="chain-bar">
+            <div class="chain-steps">
+                {% for t in chain_order %}
+                <span class="chain-step {% if loop.index < step %}done{% elif loop.index == step %}current{% endif %}">
+                    {{ loop.index }}. {{ {'poster': 'Poster', 'logo': 'Logo', 'backdrop': 'Backdrop'}[t] }}
+                </span>
+                {% if not loop.last %}<span class="chain-arrow">→</span>{% endif %}
+                {% endfor %}
+            </div>
+            <div class="chain-actions">
+                <a class="btn btn-sm btn-outline-light" href="{{ url_for('chain_skip', media_type=content_type, tmdb_id=tmdb_id, artwork_type=artwork_type, directory=directory) }}">Skip {{ artwork_config.name[:-1] | lower }} →</a>
+                <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('tv_shows' if content_type == 'tv' else 'index', artwork_type='poster', show_missing='true') }}">Stop</a>
+            </div>
+        </div>
+        {% endif %}
 
         <div class="header">
             <h1>Select {{ artwork_config.name }} for Download</h1>
@@ -264,7 +293,9 @@
                 'media_title': decodeHtml('{{ media_title }}'),
                 'media_type': '{{ content_type }}',
                 'artwork_type': '{{ artwork_type }}',
-                'directory': decodeHtml('{{ directory|default("", true) }}')
+                'directory': decodeHtml('{{ directory|default("", true) }}'),
+                'tmdb_id': '{{ tmdb_id }}',
+                'chain': '{{ '1' if chain else '' }}'
             };
 
             for (const [key, value] of Object.entries(fields)) {
