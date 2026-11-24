@@ -188,7 +188,7 @@
             </div>
             <div class="chain-actions">
                 <a class="btn btn-sm btn-outline-light" href="{{ url_for('chain_skip', media_type=content_type, tmdb_id=tmdb_id, artwork_type=artwork_type, directory=directory) }}">Skip {{ artwork_config.name[:-1] | lower }} →</a>
-                <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('tv_shows' if content_type == 'tv' else 'index', artwork_type='poster', show_missing='true') }}">Stop</a>
+                <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('chain_stop', media_type=content_type, directory=directory) }}">Stop</a>
             </div>
         </div>
         {% endif %}

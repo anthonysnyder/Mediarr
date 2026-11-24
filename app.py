@@ -7,7 +7,7 @@ import json
 import io
 import threading
 import shutil
-from flask import Flask, render_template, request, redirect, url_for, send_from_directory, send_file, Response, flash, get_flashed_messages, jsonify, make_response
+from flask import Flask, render_template, request, redirect, url_for, send_from_directory, send_file, Response, flash, get_flashed_messages, jsonify, make_response, session
 try:
     from utils.watcher import start_media_watcher
 except ImportError:
@@ -1327,6 +1327,31 @@ def _chain_step_needed(media_type, directory, artwork_type):
     dir_path = _resolve_media_dir(media_type, directory)
     return not (dir_path and _dir_has_artwork(dir_path, artwork_type))
 
+CHAIN_NAMES = {'poster': 'Poster', 'logo': 'Logo', 'backdrop': 'Backdrop'}
+
+def _chain_record(directory, media_title, artwork_type, status, local_path=None, artwork_url=None):
+    """Remember a chain step's outcome so one Slack message can be sent at the end."""
+    data = session.get('chain_slack')
+    if not data or data.get('dir') != directory:
+        data = {'dir': directory, 'title': '', 'items': []}
+    if media_title:
+        data['title'] = media_title
+    data['items'] = [i for i in data['items'] if i['type'] != artwork_type] + [
+        {'type': artwork_type, 'status': status, 'path': local_path, 'url': artwork_url}]
+    session['chain_slack'] = data
+
+def _chain_flush(directory):
+    """Send the single combined Slack message for a finished (or stopped) chain."""
+    data = session.pop('chain_slack', None)
+    if data and data.get('dir') == directory:
+        send_chain_slack_summary(data)
+
+def _notify_or_queue(chain, message, local_path, artwork_url, media_title, directory, artwork_type):
+    if chain:
+        _chain_record(directory, media_title, artwork_type, 'downloaded', local_path, artwork_url)
+    else:
+        send_slack_notification(message, local_path, artwork_url)
+
 def chain_next_redirect(media_type, tmdb_id, directory, current_type, media_title=''):
     """Redirect to the next artwork type in the chain that is still missing,
     or back to the Missing view when the chain is finished."""
@@ -1336,8 +1361,17 @@ def chain_next_redirect(media_type, tmdb_id, directory, current_type, media_titl
             route = 'select_tv' if media_type == 'tv' else 'select_movie'
             id_arg = {'tv_id': tmdb_id} if media_type == 'tv' else {'movie_id': tmdb_id}
             return redirect(url_for(route, artwork_type=next_type, directory=directory, chain='1', **id_arg))
+    _chain_flush(directory)
     redirect_url = url_for('tv_shows' if media_type == 'tv' else 'index', artwork_type=CHAIN_ORDER[0], show_missing='true')
     return redirect(f"{redirect_url}#{generate_clean_id(directory or media_title)}")
+
+@app.route('/chain_stop/<media_type>')
+def chain_stop(media_type):
+    """Stop the chain early: send Slack for whatever was downloaded, go back to Missing."""
+    directory = request.args.get('directory', '')
+    _chain_flush(directory)
+    redirect_url = url_for('tv_shows' if media_type == 'tv' else 'index', artwork_type=CHAIN_ORDER[0], show_missing='true')
+    return redirect(f"{redirect_url}#{generate_clean_id(directory)}")
 
 @app.route('/chain_skip/<media_type>/<int:tmdb_id>/<artwork_type>')
 def chain_skip(media_type, tmdb_id, artwork_type):
@@ -1346,6 +1380,7 @@ def chain_skip(media_type, tmdb_id, artwork_type):
         media_type = 'movie'
     if artwork_type in ARTWORK_TYPES:
         flash(f"Skipped {ARTWORK_TYPES[artwork_type]['name'][:-1].lower()}", 'info')
+        _chain_record(request.args.get('directory', ''), '', artwork_type, 'skipped')
     return chain_next_redirect(media_type, tmdb_id, request.args.get('directory', ''), artwork_type)
 
 @app.route('/select_movie/<int:movie_id>',methods=['GET'])
@@ -1392,6 +1427,7 @@ def select_movie(movie_id, artwork_type='poster'):
         mark_artwork_unavailable(directory, artwork_type, True)
         flash(f'No {artwork_type} artwork available on TMDb. Marked as unavailable.', 'info')
         if chain:
+            _chain_record(directory, movie_title, artwork_type, 'unavailable')
             return chain_next_redirect('movie', movie_id, directory, artwork_type, movie_title)
         return redirect(url_for('index', artwork_type=artwork_type, show_missing='true'))
 
@@ -1461,6 +1497,7 @@ def select_tv(tv_id, artwork_type='poster'):
         mark_artwork_unavailable(directory, artwork_type, True)
         flash(f'No {artwork_type} artwork available on TMDb. Marked as unavailable.', 'info')
         if chain:
+            _chain_record(directory, tv_title, artwork_type, 'unavailable')
             return chain_next_redirect('tv', tv_id, directory, artwork_type, tv_title)
         return redirect(url_for('tv_shows', artwork_type=artwork_type, show_missing='true'))
 
@@ -1674,7 +1711,7 @@ def select_artwork():
                         # Send Slack notification about successful artwork download
                         artwork_name = ARTWORK_TYPES[artwork_type]['name']
                         message = f"{artwork_name[:-1]} for '{media_title}' has been downloaded!"  # Remove trailing 's'
-                        send_slack_notification(message, local_artwork_path, artwork_url)
+                        _notify_or_queue(chain, message, local_artwork_path, artwork_url, media_title, os.path.basename(save_dir), artwork_type)
                         # Flash message for browser notification
                         flash(message, 'success')
 
@@ -1729,7 +1766,7 @@ def select_artwork():
                 # Send Slack notification about successful artwork download
                 artwork_name = ARTWORK_TYPES[artwork_type]['name']
                 message = f"{artwork_name[:-1]} for '{media_title}' has been downloaded!"  # Remove trailing 's'
-                send_slack_notification(message, local_artwork_path, artwork_url)
+                _notify_or_queue(chain, message, local_artwork_path, artwork_url, media_title, os.path.basename(save_dir), artwork_type)
                 # Flash message for browser notification
                 flash(message, 'success')
 
@@ -1755,7 +1792,7 @@ def select_artwork():
                 # Send Slack notification about successful artwork download
                 artwork_name = ARTWORK_TYPES[artwork_type]['name']
                 message = f"{artwork_name[:-1]} for '{media_title}' has been downloaded!"
-                send_slack_notification(message, local_artwork_path, artwork_url)
+                _notify_or_queue(chain, message, local_artwork_path, artwork_url, media_title, os.path.basename(save_dir), artwork_type)
                 # Flash message for browser notification
                 flash(message, 'success')
             else:
@@ -1903,7 +1940,7 @@ def confirm_directory():
         # Send Slack notification about successful download
         artwork_name = ARTWORK_TYPES[artwork_type]['name']
         message = f"{artwork_name[:-1]} for '{media_title}' has been downloaded!"
-        send_slack_notification(message, local_artwork_path, artwork_url)
+        _notify_or_queue(chain, message, local_artwork_path, artwork_url, media_title, os.path.basename(save_dir), artwork_type)
         app.logger.info(f"{artwork_name} successfully saved to {local_artwork_path}")
     else:
         app.logger.error(f"Failed to save {artwork_type} for '{media_title}'")
@@ -1926,24 +1963,47 @@ def confirm_directory():
 
 # Function to send Slack notifications about poster downloads
 def send_slack_notification(message, local_poster_path, poster_url):
+    # Single-artwork message: one attachment with the TMDb image
+    _post_slack({
+        "text": message,
+        "attachments": [
+            {
+                "text": f"Saved to: {local_poster_path}",
+                "image_url": poster_url  # Display original TMDb artwork in Slack
+            }
+        ]
+    }, local_poster_path)
+
+def send_chain_slack_summary(data):
+    """One Slack message per title for the "All 3" chain, one image per downloaded type."""
+    order = {t: i for i, t in enumerate(CHAIN_ORDER)}
+    items = sorted(data.get('items', []), key=lambda i: order.get(i['type'], 99))
+    got = [i for i in items if i['status'] == 'downloaded']
+    if not got:
+        return
+    title = data.get('title') or data.get('dir')
+    notes = [f"no {CHAIN_NAMES[i['type']].lower()} on TMDb" for i in items if i['status'] == 'unavailable']
+    notes += [f"{CHAIN_NAMES[i['type']].lower()} skipped" for i in items if i['status'] == 'skipped']
+    text = f"Artwork for '{title}' has been downloaded: {', '.join(CHAIN_NAMES[i['type']] for i in got)}"
+    if notes:
+        text += f" ({'; '.join(notes)})"
+    _post_slack({
+        "text": text,
+        "attachments": [
+            {"title": CHAIN_NAMES[i['type']], "text": f"Saved to: {i['path']}", "image_url": i['url']}
+            for i in got
+        ]
+    }, title)
+
+def _post_slack(payload, label):
     # Retrieve Slack webhook URL from environment variables
     slack_webhook_url = os.getenv('SLACK_WEBHOOK_URL')
     if slack_webhook_url:
-        # Prepare Slack payload with message and poster details
-        payload = {
-            "text": message,
-            "attachments": [
-                {
-                    "text": f"Poster saved to: {local_poster_path}",
-                    "image_url": poster_url  # Display original TMDb poster in Slack
-                }
-            ]
-        }
         try:
             # Send notification to Slack
             response = requests.post(slack_webhook_url, json=payload)
             if response.status_code == 200:
-                print(f"Slack notification sent successfully for '{local_poster_path}'")
+                print(f"Slack notification sent successfully for '{label}'")
             else:
                 print(f"Failed to send Slack notification. Status code: {response.status_code}")
         except Exception as e:
